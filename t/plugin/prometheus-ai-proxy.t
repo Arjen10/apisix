@@ -579,3 +579,270 @@ X-AI-Fixture-Status: 429
 GET /apisix/prometheus/metrics
 --- response_body eval
 qr/apisix_llm_latency_count\{type="total",.*route_id="5",.*,node="openai-gpt4".*request_type="ai_chat",request_llm_model="gpt-3",llm_model="gpt-4"\} 1\n/
+
+
+
+=== TEST 31: llm_active_connections is 0 on the failed instance after fallback retry
+--- http_config
+        server {
+            listen 6731;
+            default_type 'application/json';
+            location / {
+                content_by_lua_block {
+                    ngx.status = 500
+                    ngx.say([[{ "error": {"message":"internal error"}}]])
+                }
+            }
+        }
+        server {
+            listen 6733;
+            default_type 'application/json';
+            location / {
+                content_by_lua_block {
+                    ngx.status = 200
+                    ngx.say([[{
+                        "id": "chatcmpl-ok",
+                        "object": "chat.completion",
+                        "model": "gpt-4o",
+                        "choices": [{
+                            "index": 0,
+                            "message": {"role": "assistant", "content": "2"},
+                            "finish_reason": "stop"
+                        }],
+                        "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+                    }]])
+                }
+            }
+        }
+--- config
+    location /t {
+        content_by_lua_block {
+            local t = require("lib.test_admin").test
+            local code, body = t('/apisix/admin/routes/fallback-gauge',
+                ngx.HTTP_PUT,
+                [[{
+                    "uri": "/chat-fallback-gauge",
+                    "plugins": {
+                        "prometheus": {},
+                        "ai-proxy-multi": {
+                            "fallback_strategy": ["http_5xx"],
+                            "ssl_verify": false,
+                            "instances": [
+                                {
+                                    "name": "fallback-fail",
+                                    "provider": "openai-compatible",
+                                    "weight": 1,
+                                    "priority": 10,
+                                    "auth": {"header": {"Authorization": "Bearer token"}},
+                                    "options": {"model": "gpt-4"},
+                                    "override": {"endpoint": "http://127.0.0.1:6731"}
+                                },
+                                {
+                                    "name": "fallback-ok",
+                                    "provider": "openai-compatible",
+                                    "weight": 1,
+                                    "priority": 0,
+                                    "auth": {"header": {"Authorization": "Bearer token"}},
+                                    "options": {"model": "gpt-4o"},
+                                    "override": {"endpoint": "http://127.0.0.1:6733"}
+                                }
+                            ]
+                        }
+                    }
+                }]]
+            )
+            if code >= 300 then
+                ngx.status = code
+                ngx.say(body)
+                return
+            end
+
+            local code, body = t('/apisix/admin/routes/metrics',
+                ngx.HTTP_PUT,
+                [[{
+                    "uri": "/apisix/prometheus/metrics",
+                    "plugins": { "public-api": {} }
+                }]]
+            )
+            if code >= 300 then
+                ngx.status = code
+                ngx.say(body)
+                return
+            end
+
+            local http = require("resty.http")
+            local httpc = http.new()
+            local res, err = httpc:request_uri(
+                "http://127.0.0.1:" .. ngx.var.server_port .. "/chat-fallback-gauge",
+                {
+                    method = "POST",
+                    headers = { ["Content-Type"] = "application/json" },
+                    body = [[{"messages":[{"role":"user","content":"What is 1+1?"}],"model":"client-model"}]],
+                }
+            )
+            if not res then
+                ngx.say("failed to send chat request: " .. (err or "unknown"))
+                return
+            end
+            if res.status ~= 200 then
+                ngx.say("expected 200 after fallback, got " .. res.status .. ": " .. (res.body or ""))
+                return
+            end
+
+            ngx.sleep(1)
+
+            local metric_resp, err = httpc:request_uri(
+                "http://127.0.0.1:" .. ngx.var.server_port .. "/apisix/prometheus/metrics"
+            )
+            if not metric_resp then
+                ngx.say("failed to fetch metrics: " .. (err or "unknown"))
+                return
+            end
+
+            local function sample(node)
+                return metric_resp.body:match(
+                    'apisix_llm_active_connections{[^}\n]*node="' .. node .. '"[^}\n]*}%s+([%d%.]+)'
+                )
+            end
+
+            local fail_val = sample("fallback-fail")
+            local ok_val = sample("fallback-ok")
+            local nonzero = metric_resp.body:match(
+                [[apisix_llm_active_connections%b{}%s+[1-9]%d*%.?%d*]]
+            )
+
+            if fail_val ~= "0" and fail_val ~= "0.0" then
+                ngx.say("failed instance series expected 0, got ", tostring(fail_val), ":\n",
+                        metric_resp.body)
+                return
+            end
+            if ok_val ~= "0" and ok_val ~= "0.0" then
+                ngx.say("ok instance series expected 0, got ", tostring(ok_val), ":\n",
+                        metric_resp.body)
+                return
+            end
+            if nonzero then
+                ngx.say("llm_active_connections has non-zero sample:\n", metric_resp.body)
+                return
+            end
+            ngx.say("passed")
+        }
+    }
+--- request
+GET /t
+--- response_body
+passed
+--- error_log
+falling back to fallback-ok
+
+
+
+=== TEST 32: llm_active_connections is 0 on every instance when fallback is exhausted
+--- http_config
+        server {
+            listen 6731;
+            default_type 'application/json';
+            location / {
+                content_by_lua_block {
+                    ngx.status = 500
+                    ngx.say([[{ "error": {"message":"internal error"}}]])
+                }
+            }
+        }
+--- config
+    location /t {
+        content_by_lua_block {
+            local t = require("lib.test_admin").test
+            local code, body = t('/apisix/admin/routes/fallback-gauge-all-fail',
+                ngx.HTTP_PUT,
+                [[{
+                    "uri": "/chat-fallback-gauge-all-fail",
+                    "plugins": {
+                        "prometheus": {},
+                        "ai-proxy-multi": {
+                            "fallback_strategy": ["http_5xx"],
+                            "ssl_verify": false,
+                            "instances": [
+                                {
+                                    "name": "fallback-fail-a",
+                                    "provider": "openai-compatible",
+                                    "weight": 1,
+                                    "priority": 10,
+                                    "auth": {"header": {"Authorization": "Bearer token"}},
+                                    "options": {"model": "gpt-4"},
+                                    "override": {"endpoint": "http://127.0.0.1:6731"}
+                                },
+                                {
+                                    "name": "fallback-fail-b",
+                                    "provider": "openai-compatible",
+                                    "weight": 1,
+                                    "priority": 0,
+                                    "auth": {"header": {"Authorization": "Bearer token"}},
+                                    "options": {"model": "gpt-4o"},
+                                    "override": {"endpoint": "http://127.0.0.1:6731"}
+                                }
+                            ]
+                        }
+                    }
+                }]]
+            )
+            if code >= 300 then
+                ngx.status = code
+                ngx.say(body)
+                return
+            end
+
+            local http = require("resty.http")
+            local httpc = http.new()
+            local res, err = httpc:request_uri(
+                "http://127.0.0.1:" .. ngx.var.server_port .. "/chat-fallback-gauge-all-fail",
+                {
+                    method = "POST",
+                    headers = { ["Content-Type"] = "application/json" },
+                    body = [[{"messages":[{"role":"user","content":"What is 1+1?"}],"model":"client-model"}]],
+                }
+            )
+            if not res then
+                ngx.say("failed to send chat request: " .. (err or "unknown"))
+                return
+            end
+            if res.status < 500 then
+                ngx.say("expected 5xx after exhausted fallback, got " .. res.status)
+                return
+            end
+
+            ngx.sleep(1)
+
+            local metric_resp, err = httpc:request_uri(
+                "http://127.0.0.1:" .. ngx.var.server_port .. "/apisix/prometheus/metrics"
+            )
+            if not metric_resp then
+                ngx.say("failed to fetch metrics: " .. (err or "unknown"))
+                return
+            end
+
+            local function sample(node)
+                return metric_resp.body:match(
+                    'apisix_llm_active_connections{[^}\n]*node="' .. node .. '"[^}\n]*}%s+([%d%.]+)'
+                )
+            end
+
+            local a_val = sample("fallback-fail-a")
+            local b_val = sample("fallback-fail-b")
+            if a_val ~= "0" and a_val ~= "0.0" then
+                ngx.say("instance A series expected 0, got ", tostring(a_val), ":\n",
+                        metric_resp.body)
+                return
+            end
+            if b_val ~= "0" and b_val ~= "0.0" then
+                ngx.say("instance B series expected 0, got ", tostring(b_val), ":\n",
+                        metric_resp.body)
+                return
+            end
+            ngx.say("passed")
+        }
+    }
+--- request
+GET /t
+--- response_body
+passed

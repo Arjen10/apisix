@@ -503,6 +503,11 @@ function _M.before_proxy(conf, ctx, on_error)
             return 500
         end
         if code_or_err and on_error then
+            -- ctx tracks the lifecycle of the request
+            -- if the LLM request fails, on_error may modify the llm_active_connection key
+            -- the active connection count is decremented here
+            exporter.dec_llm_active_connections(ctx)
+            ctx.llm_active_connections_tracked = false
             local abort_code = on_error(ctx, conf, code_or_err, body)
             if abort_code then
                 return abort_code, body
